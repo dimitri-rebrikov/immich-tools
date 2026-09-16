@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# uv
+.uv/
+
+# Secrets and local overrides
+.env
+.env.*
+!.env.example
+
+# Tool output (favorite_rated.py --json-report): contains asset ids
+favorites*.json
+*-report.json
+
+# Editors / OS
+.idea/
+.DS_Store
+Thumbs.db
