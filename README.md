@@ -101,7 +101,7 @@ re-running after any failure picks up exactly what is left.
 | `--revert PATH` | - | remove the favorite flag from a report's assets |
 | `--retries N`, `--timeout S` | `3`, `30` | retry/backoff and request timeout |
 | `--insecure` | off | skip TLS verification (self-signed homelab certs) |
-| `-q`, `-v` | - | quiet progress / log every HTTP request |
+| `-q`, `-v` | - | quiet progress / log every HTTP request (errors are always printed, even with `-q`) |
 
 Exit codes: `0` success (or nothing to do), `1` at least one update batch failed,
 `2` configuration or API error before any write.

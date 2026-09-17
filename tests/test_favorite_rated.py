@@ -211,6 +211,19 @@ class ApplyTest(unittest.TestCase):
         self.assertIn("HTTP 401", err)
         self.assertNotIn("Traceback", err)
 
+    def test_quiet_still_reports_errors_on_stderr(self):
+        server = FakeImmich(search_status=401)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = favorite_rated.main(
+                ["--url", "https://immich.test", "--api-key", "test-key", "--quiet"],
+                transport=server,
+                sleep=lambda _seconds: None,
+                log=favorite_rated.Logger(quiet=True, stream=err),
+            )
+        self.assertEqual(code, 2)
+        self.assertIn("HTTP 401", err.getvalue())
+
     def test_version_below_3_2_aborts_before_searching(self):
         server = FakeImmich(version=(3, 1, 4), pages=[[asset("a1")]])
         code, _, err = run(server)

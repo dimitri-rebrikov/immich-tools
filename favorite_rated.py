@@ -69,10 +69,11 @@ class Logger:
         self.verbose = verbose
         self.stream = stream if stream is not None else sys.stderr
 
-    def __call__(self, message: str, *, debug: bool = False) -> None:
+    def __call__(self, message: str, *, debug: bool = False, force: bool = False) -> None:
+        """`debug` needs --verbose; `force` wins over --quiet (errors must always be visible)."""
         if debug and not self.verbose:
             return
-        if not debug and self.quiet:
+        if not debug and self.quiet and not force:
             return
         print(message, file=self.stream, flush=True)
 
@@ -294,7 +295,7 @@ def revert_run(client: ImmichClient, args, log: Logger) -> int:
     try:
         payload = json.loads(Path(args.revert).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        log(f"error: cannot read report {args.revert}: {exc}")
+        log(f"error: cannot read report {args.revert}: {exc}", force=True)
         return 2
 
     ids = [entry.get("id") for entry in payload.get("assets") or [] if entry.get("id")]
@@ -392,13 +393,16 @@ def main(argv=None, *, transport=None, sleep=time.sleep, log: Logger | None = No
     try:
         version = client.server_version()
     except ImmichError as exc:
-        logger(f"error: cannot reach the Immich API: {exc}")
+        logger(f"error: cannot reach the Immich API: {exc}", force=True)
         return 2
 
     logger(f"server version {'.'.join(str(part) for part in version)}")
     if version < MIN_SUPPORTED_VERSION:
         wanted = ".".join(str(part) for part in MIN_SUPPORTED_VERSION)
-        logger(f"error: Immich {wanted}+ required (structured search filter), found {'.'.join(str(part) for part in version)}")
+        logger(
+            f"error: Immich {wanted}+ required (structured search filter), found {'.'.join(str(part) for part in version)}",
+            force=True,
+        )
         return 2
 
     if args.revert:
@@ -408,7 +412,7 @@ def main(argv=None, *, transport=None, sleep=time.sleep, log: Logger | None = No
         user_id = client.me()
         candidates, stats = collect_candidates(client, user_id, args, logger)
     except ImmichError as exc:
-        logger(f"error: {exc}")
+        logger(f"error: {exc}", force=True)
         return 2
 
     skipped = stats["skipped"]
