@@ -20,7 +20,11 @@ import unittest
 from pathlib import Path
 from urllib.parse import urlsplit
 
-SCRIPT_PATH = Path(__file__).resolve().parent.parent / "favorite_rated.py"
+SCRIPT_ROOT = Path(__file__).resolve().parent.parent
+if str(SCRIPT_ROOT) not in sys.path:  # the script imports immich_api from the repo root
+    sys.path.insert(0, str(SCRIPT_ROOT))
+
+SCRIPT_PATH = SCRIPT_ROOT / "favorite_rated.py"
 _spec = importlib.util.spec_from_file_location("favorite_rated", SCRIPT_PATH)
 favorite_rated = importlib.util.module_from_spec(_spec)
 sys.modules["favorite_rated"] = favorite_rated
