@@ -4,10 +4,12 @@ Small scripts for the [Immich](https://immich.app) API built around its v3 searc
 
 ## Shared code (`immich_api.py`)
 
-All three scripts take their HTTP plumbing from `immich_api.py`: the API client with retry/backoff,
+All scripts take their HTTP plumbing from `immich_api.py`: the API client with retry/backoff,
 `normalize_url`, the `Logger`, `ImmichError` and the argparse type helpers. It is a module, not a
 script - the PEP 723 header and the CLI stay in the scripts, so `uv run <script>.py` is enough.
 Each script narrows the permissions named in an HTTP 403 message to the ones it actually needs.
+`external_library_changes.py` is the exception: it never talks to Immich and only uses the
+`Logger`, so it runs without any credentials.
 
 ## `conditional_albums.py`
 
@@ -367,15 +369,158 @@ finished, and is `null` when there was no `--wait`, the wait failed, or the libr
 nor `--wait` asked for it. `scanQueued` / `scanError` are only meaningful in scan mode, so they stay
 `false` / `null` for a `--status` run.
 
+## `external_library_changes.py`
+
+Answers "did anything change in this directory since the last scan?" for an Immich external
+library folder. It is the *condition* half of a dagu DAG: `--check` walks the tree, the DAG runs
+`external_library_scan.py` only when it changed, and `--record` stores the new state afterwards.
+
+```yaml
+# immich-library-scan.yaml - detect -> scan -> record, one dagu run per interval
+working_dir: /opt/immich-tools
+env:
+  - IMMICH_URL: https://immich.example.com
+  - IMMICH_API_KEY: ${IMMICH_API_KEY}
+steps:
+  - id: detect
+    run: uv run external_library_changes.py --path /srv/photos --state /var/lib/dagu/photos.state.json --check
+    output: CHANGED
+  - id: scan
+    depends: detect
+    preconditions:
+      - condition: ${CHANGED}
+        expected: changed=yes
+    run: uv run external_library_scan.py --apply --wait
+  - id: record
+    depends: scan
+    run: uv run external_library_changes.py --path /srv/photos --state /var/lib/dagu/photos.state.json --record --apply
+```
+
+Why the DAG looks like this:
+
+- **The verdict is a line, not an exit code.** `--check` exits `0` for `changed=yes` *and* for
+  `changed=no`, because dagu treats a step that exits non-zero as failed. The gate is the trailing
+  `changed=yes`/`changed=no` line, matched by `output: CHANGED` plus the value-match precondition
+  (line-exact, `re:`/`num:` also work). In a shell, use
+  `external_library_changes.py --check -q | grep -q '^changed=yes'`.
+- `depends: detect` is required: a `${...}` reference inside a precondition does **not** create a
+  dependency in dagu, and `${CHANGED}` only resolves once the step has published its output.
+- **`record` is a separate, later step.** It only starts when the scan really ran and succeeded -
+  dagu does not start a dependent step when its dependency was skipped or failed. That is exactly
+  what makes the design safe: a scan that fails (Immich down, bad API key, queue paused) leaves the
+  state untouched, so the next run still sees the change and scans again. Recording earlier would
+  silently swallow the change.
+- `record` walks the tree again, *after* the scan, so files that arrived while the scan was running
+  are part of the new baseline.
+- First run: there is no state yet, so `--check` reports `changed=yes` (reason `no-state`) - the DAG
+  scans once and `record` creates the baseline.
+- Keep `--state` on persistent storage and outside the watched trees. Give the library's other
+  `importPaths` their own `--path` flag (repeatable), they are tracked separately.
+
+### What is compared
+
+- Per file: **size and mtime in nanoseconds**. No file content is read, no hash is computed, so a
+  walk over a 100k-file library is just directory metadata.
+- Directories are tracked by name, which is what makes added and removed **empty** directories
+  visible. Renames count as `added` + `removed`.
+- `--list` names the reason per file: `(1 -> 4 bytes)` for a resized file, `(same size, newer mtime)`
+  for one that was rewritten in place. That second case is why the size alone is not enough, and why
+  a backup restored with old timestamps is still caught.
+- Symlinks are never followed - a link is a leaf, so retargeting it is a change while changes behind
+  it are invisible.
+- Ignored: the NAS and OS noise `@eaDir`, `.DS_Store`, `Thumbs.db`, `*.tmp` plus every `--exclude`
+  pattern (shell wildcards, matched against the path below the root and against the bare file name).
+  The state file itself is ignored, even if it lives inside a watched tree.
+- An unreadable *root* is a hard error (`1`) in both modes - an empty walk would otherwise look like
+  "everything was deleted". Unreadable subdirectories are reported and skipped.
+
+### Modes
+
+| Mode | Writes | Walks | Answer |
+| --- | --- | --- | --- |
+| `--check` (default) | never | yes | `changed=yes` / `changed=no` |
+| `--record` | only with `--apply` | yes | `WOULD RECORD ...` / `RECORDED ...` |
+| `--status` | no | no | what the state file holds (paths, timestamps, counts) |
+
+`--check` never writes, not even when the state file is missing, and a broken or foreign state file
+fails open: it logs a warning and reports `changed=yes` (reason `state-unreadable`), one scan too many
+beats a missed change. A state file recorded for other `--path` values reports `paths-changed`.
+
+### Usage
+
+```bash
+# detect (read-only), then record the new baseline after a successful scan
+uv run external_library_changes.py --path /srv/photos --state photos.state.json --check
+uv run external_library_changes.py --path /srv/photos --state photos.state.json --record --apply
+
+# shell gate instead of a dagu precondition
+uv run external_library_changes.py --path /srv/photos --state photos.state.json --check -q | grep -q '^changed=yes'
+
+# what changed, and when was the last record?
+uv run external_library_changes.py --path /srv/photos --state photos.state.json --check --list
+uv run external_library_changes.py --state photos.state.json --status
+
+# two import paths, machine-readable report
+uv run external_library_changes.py --path /srv/photos --path /srv/videos --state both.state.json --check --list --json
+```
+
+```console
+$ uv run external_library_changes.py --path /srv/photos --state photos.state.json --check --list
+state: photos.state.json (record 7, updated 2026-09-28 19:31:02+0200)
+watching: /srv/photos (54027 files, 3812 dirs)
+changes: added=1 removed=1 modified=1 dirs_added=1 dirs_removed=0
+  ~ /srv/photos/2026/urlaub/img_0001.jpg (4821337 -> 4820999 bytes)
+  + /srv/photos/2026/urlaub/img_0002.jpg
+  - /srv/photos/2026/alt/scan_01.tif
+  + dir /srv/photos/2026/neu
+changed=yes
+
+$ uv run external_library_changes.py --state photos.state.json --status
+state: photos.state.json
+tool: external_library_changes (version 1)
+created: 2026-09-14 08:00:00+0200
+updated: 2026-09-28 19:31:02+0200 (age 1.2h)
+records: 7
+paths: 1
+  /srv/photos - 54027 files, 3812 dirs
+```
+
+### Options
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--path DIR` | - | directory to watch, repeatable; required unless `--status` |
+| `--state FILE` | - | snapshot to compare against / write, **required** |
+| `--check` / `--record` / `--status` | `--check` | what the run does (see the table above) |
+| `--apply` | off | let `--record` actually write; `--apply` without `--record` is an error |
+| `--exclude PATTERN` | - | extra ignore pattern, repeatable (defaults always apply) |
+| `--list` | off | list the changed paths, at most 20 per kind (also in the JSON `details`) |
+| `--json` | off | one JSON report on stdout, human lines move to stderr |
+| `-q`, `-v` | - | only the verdict / log every walked directory |
+
+Exit codes: `0` the verdict was determined (changed or not) or the record was written,
+`1` the run failed (a root could not be read, the state file could not be written), `2`
+configuration error (missing or unusable arguments, a `--path` that is not a directory).
+
+The JSON report of `--check` carries `changed`, `reason` (`changed`, `unchanged`, `no-state`,
+`state-unreadable`, `paths-changed`), `previous` (the state's timestamps and `records` counter),
+`paths` (per path: file/dir counts and its own `changes`) and `changes` (the summed
+`added`/`removed`/`modified`/`dirs_added`/`dirs_removed`/`total`); with `--list` it also carries
+`details` with the capped path lists plus an `omitted` counter. The state file itself is JSON:
+`{"tool", "version", "created_at", "updated_at", "records", "paths": [{"path", "files", "dirs"}]}`
+with `files` mapping each relative path to `[size, mtime_ns]`. It is written atomically (temp file
+plus `os.replace`), and `--status` never touches it.
+
 ## Tests
 
 ```bash
 uv run tests/test_favorite_rated.py
 uv run tests/test_conditional_albums.py
 uv run tests/test_external_library_scan.py
+uv run tests/test_external_library_changes.py
 ```
 
-All three suites fake the HTTP layer, so they never touch a real server. The failure paths above are
+All suites fake the HTTP layer, so they never touch a real server. The failure paths above are
 covered too, e.g. `test_failed_batch_is_reported_and_remaining_batches_still_run` (a 403 in the
 middle batch: all batches are still attempted, exit code `1`) and
 `test_apply_batches_requests_and_sends_favorite_true` (1200 candidates -> `500/500/200`).
@@ -394,6 +539,16 @@ document) and the fact that waiting uses a fake clock, so the timeout case is in
 reproducible. On the reporting side it covers the statistics degradation
 (`test_a_failing_statistics_call_degrades_to_unknown_counts`), the `refreshed=never` case and
 `test_statistics_are_read_before_the_scans_start`.
+
+The `external_library_changes` suite works on temp directories instead of a fake server, because the
+script has no HTTP layer at all. It pins the compare logic, e.g. `test_deeply_nested_change_is_found`
+(a file five levels down), `test_same_size_with_a_newer_mtime_is_a_change`,
+`test_resized_file_is_a_change_even_with_a_restored_mtime` and `test_empty_directories_are_tracked`,
+plus the safety properties: `test_check_never_rewrites_the_state_file`,
+`test_state_file_inside_the_watched_tree_is_ignored`, `test_unusable_state_fails_open_with_a_warning`,
+`test_unreadable_root_fails_instead_of_recording_an_empty_tree` (skipped on Windows, where `chmod`
+does not make a directory unreadable) and `test_the_whole_dag_cycle_works` (check -> record -> check
+-> change -> record -> check).
 
 ## License
 
