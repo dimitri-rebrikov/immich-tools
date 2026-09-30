@@ -15,20 +15,21 @@ flag, which is exactly what `FileDirectoryInformation` returns. Asking for
 `FileIdBothDirectoryInformation` (which also carries the FileId and the 8.3 name) measured no faster
 (23.6 s vs 23.2 s for 54 336 files) - the server's cost per entry dominates anyway.
 
-The result is a snapshot document that `external_library_changes.py` consumes with
-`--snapshot-in`, so the change/state/report logic stays in that (tested, credential-free) script:
+The result is a state document that `external_library_snapshot_compare.py` compares against the
+persisted baseline - the producer only walks, the comparer only compares:
 
     {"tool": "external_library_smb_snapshot", "version": 1, "generated_at": "...",
      "source": "smb://nas/photos/2026", "paths": [{"path": "/srv/photos",
      "files": {"2026/09/img.jpg": [4821337, 1758051234123456789]}, "dirs": ["2026", "2026/09"]}]}
 
 `size` is bytes, `mtime` is nanoseconds since the Unix epoch (converted from the SMB FILETIME),
-exactly like `os.stat().st_mtime_ns` in the walk-based mode. Both sources describe the same server
-metadata, but the SMB path rounds to microseconds, so **switching the source of a library reports
-every file as `modified` once** and then stays quiet again.
+exactly like the `os.stat().st_mtime_ns` the local producer reports. Both sources describe the same
+server metadata, but the SMB path rounds to microseconds, so **switching a library between the two
+producers reports every file as `modified` once** and then stays quiet again.
 
-What is walked: same rules as `external_library_changes.py` - symlinks/reparse points are never
-followed (they are leaves), directories are tracked by name (so empty ones are visible), and the
+What is walked: same rules as the local producer `external_library_snapshot.py` - symlinks/reparse
+points are never followed (they are leaves), directories are tracked by name (so empty ones are
+visible), and the
 `--exclude` patterns are applied to the path below the root and to the bare name. Excluded
 *directories* are not descended into, which is the only way to save real work.
 
@@ -44,7 +45,7 @@ Usage:
 
     # straight into the change gate, without a file in between
     uv run external_library_smb_snapshot.py --host nas --share photos -q | \\
-        uv run external_library_changes.py --state photos.state.json --snapshot-in - --check
+        uv run external_library_snapshot_compare.py --state photos.state.json --current - -q
 
 Authentication is NTLM by default (`--user`/`--password`, env `SMB_USER`/`SMB_PASSWORD`, or
 `--password-file`); Kerberos works when the `smbprotocol[kerberos]` extras and a ticket are present.
@@ -73,8 +74,8 @@ from immich_api import Logger, positive_int
 
 REPORT_TOOL = "external_library_smb_snapshot"
 SNAPSHOT_VERSION = 1
-# Must stay in sync with external_library_changes.py; tests/test_external_library_smb_snapshot.py
-# asserts that both tuples are equal, so the two scripts cannot drift apart silently.
+# Must stay in sync with external_library_snapshot.py; test_external_library_snapshot.py asserts
+# that both tuples are equal, so the two producers cannot drift apart silently.
 DEFAULT_EXCLUDES = ("@eaDir", ".DS_Store", "Thumbs.db", "*.tmp")
 MAX_LISTED = 20
 
@@ -375,8 +376,8 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(
         prog="external_library_smb_snapshot.py",
         description=(
-            "Snapshot an SMB share over SMB2/3 (no mount, no root) for external_library_changes.py "
-            "--snapshot-in. The snapshot goes to stdout, progress goes to stderr."
+            "Snapshot an SMB share over SMB2/3 (no mount, no root) into a state document for "
+            "external_library_snapshot_compare.py. The snapshot goes to stdout, progress goes to stderr."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(

@@ -29,7 +29,7 @@ always ignored. The file this run writes is never part of the snapshot.
 Usage:
     uv run external_library_snapshot.py --path /srv/photos --out photos.snapshot.json
     uv run external_library_snapshot.py --path /srv/photos -q | \\
-        uv run external_library_snapshot_compare.py --state photos.state.json --snapshot-in - --check
+        uv run external_library_snapshot_compare.py --state photos.state.json --current - -q
 
 Exit codes: 0 the snapshot was written, 1 a tree could not be read (nothing is written, so a half
 empty tree can never be compared), 2 configuration error.

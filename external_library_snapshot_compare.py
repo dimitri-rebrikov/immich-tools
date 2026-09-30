@@ -373,7 +373,7 @@ def parse_args(argv):
             "The verdict is the trailing `changed=yes|no` line, not the exit code: a step that exits\n"
             "non-zero counts as failed in most schedulers. A DAG gates on the line via `output:` plus\n"
             "`preconditions: [{condition: ${CHANGED}, expected: changed=yes}]`, in a shell:\n"
-            "--check -q | grep -q '^changed=yes'.\n"
+            "... --current - -q | grep -q '^changed=yes'.\n"
         ),
     )
     parser.add_argument(
