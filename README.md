@@ -8,8 +8,9 @@ All scripts take their HTTP plumbing from `immich_api.py`: the API client with r
 `normalize_url`, the `Logger`, `ImmichError` and the argparse type helpers. It is a module, not a
 script - the PEP 723 header and the CLI stay in the scripts, so `uv run <script>.py` is enough.
 Each script narrows the permissions named in an HTTP 403 message to the ones it actually needs.
-`external_library_changes.py` is the exception: it never talks to Immich and only uses the
-`Logger`, so it runs without any credentials.
+`external_library_snapshot.py`, `external_library_smb_snapshot.py` and
+`external_library_snapshot_compare.py` are the exception: they never talk to Immich and only use the
+`Logger`, so they run without any Immich credentials.
 
 ## `conditional_albums.py`
 
@@ -369,21 +370,54 @@ finished, and is `null` when there was no `--wait`, the wait failed, or the libr
 nor `--wait` asked for it. `scanQueued` / `scanError` are only meaningful in scan mode, so they stay
 `false` / `null` for a `--status` run.
 
-## `external_library_changes.py`
+## The snapshot trio
 
-Answers "did anything change in this directory since the last scan?" for an Immich external
-library folder. It is the *condition* half of a dagu DAG: `--check` walks the tree, the DAG runs
-`external_library_scan.py` only when it changed, and `--record` stores the new state afterwards.
+Three scripts with one job each: two *producers* list a tree and write a state document, one
+*comparer* compares two of those documents. The comparer never touches the disk, the producers never
+compare, and nothing else is shared between them.
+
+| Script | Job |
+| --- | --- |
+| `external_library_snapshot.py` | list a local directory tree |
+| `external_library_smb_snapshot.py` | list an SMB share without a mount |
+| `external_library_snapshot_compare.py` | compare a persisted baseline with a current state |
+
+A *state* is the document both producers write and the comparer reads:
+
+```json
+{"tool": "external_library_snapshot", "version": 1, "generated_at": "2026-09-30T12:00:00+0200",
+ "source": "dir:/srv/photos",
+ "paths": [{"path": "/srv/photos", "files": {"2026/09/img.jpg": [4821337, 1758051234123456789]},
+            "dirs": ["2026", "2026/09"]}]}
+```
+
+Any producer that emits that shape works: the comparer only needs `paths[].path/files/dirs`.
+
+## `external_library_snapshot_compare.py`
+
+Compares two states of the same trees - the persisted baseline (`--state`) and the state produced for
+this run (`--current`, a file or `-` for stdin) - and prints `changed=yes|no`. It writes nothing. That
+is the *condition* half of a dagu DAG: the DAG runs `external_library_scan.py` only when the verdict is
+`changed=yes`.
+
+A producer writes both states, so there is one operation per source and one comparison:
 
 ```yaml
-# immich-library-scan.yaml - detect -> scan -> record, one dagu run per interval
+# immich-library-scan.yaml - produce -> compare -> scan -> produce into the state file
 working_dir: /opt/immich-tools
 env:
   - IMMICH_URL: https://immich.example.com
   - IMMICH_API_KEY: ${IMMICH_API_KEY}
 steps:
+  - id: snapshot
+    run: >-
+      uv run external_library_snapshot.py --path /srv/photos
+      --out /var/lib/dagu/photos.now.json
   - id: detect
-    run: uv run external_library_changes.py --path /srv/photos --state /var/lib/dagu/photos.state.json --check
+    depends: snapshot
+    run: >-
+      uv run external_library_snapshot_compare.py --state /var/lib/dagu/photos.state.json
+      --current /var/lib/dagu/photos.now.json
     output: CHANGED
   - id: scan
     depends: detect
@@ -393,131 +427,257 @@ steps:
     run: uv run external_library_scan.py --apply --wait
   - id: record
     depends: scan
-    run: uv run external_library_changes.py --path /srv/photos --state /var/lib/dagu/photos.state.json --record --apply
+    run: >-
+      uv run external_library_snapshot.py --path /srv/photos
+      --out /var/lib/dagu/photos.state.json
 ```
 
 Why the DAG looks like this:
 
-- **The verdict is a line, not an exit code.** `--check` exits `0` for `changed=yes` *and* for
+- **The verdict is a line, not an exit code.** The comparer exits `0` for `changed=yes` *and* for
   `changed=no`, because dagu treats a step that exits non-zero as failed. The gate is the trailing
   `changed=yes`/`changed=no` line, matched by `output: CHANGED` plus the value-match precondition
-  (line-exact, `re:`/`num:` also work). In a shell, use
-  `external_library_changes.py --check -q | grep -q '^changed=yes'`.
+  (line-exact, `re:`/`num:` also work). In a shell: `... -q | grep -q '^changed=yes'`.
 - `depends: detect` is required: a `${...}` reference inside a precondition does **not** create a
   dependency in dagu, and `${CHANGED}` only resolves once the step has published its output.
-- **`record` is a separate, later step.** It only starts when the scan really ran and succeeded -
-  dagu does not start a dependent step when its dependency was skipped or failed. That is exactly
-  what makes the design safe: a scan that fails (Immich down, bad API key, queue paused) leaves the
-  state untouched, so the next run still sees the change and scans again. Recording earlier would
-  silently swallow the change.
-- `record` walks the tree again, *after* the scan, so files that arrived while the scan was running
-  are part of the new baseline.
-- First run: there is no state yet, so `--check` reports `changed=yes` (reason `no-state`) - the DAG
-  scans once and `record` creates the baseline.
-- Keep `--state` on persistent storage and outside the watched trees. Give the library's other
-  `importPaths` their own `--path` flag (repeatable), they are tracked separately.
+- **`record` runs after the scan and only when it succeeded** - dagu does not start a dependent step
+  when its dependency was skipped or failed. The baseline therefore never advances on a failed scan
+  (Immich down, bad API key, queue paused), and the next run still sees the change.
+- **`record` is just the producer again, writing the state file.** It walks a second time, but only
+  after something really changed, and the baseline is then the state *after* the scan: no change is
+  reported twice, at the price that a file which arrived while the scan was running counts as seen.
+  Whatever runs between the producer steps should be idempotent, or keep its own marker.
+- First run: there is no baseline yet, so the comparer reports `changed=yes` (reason `no-state`) - the
+  DAG scans once and the record step creates it.
+- Keep the state file on persistent storage and **outside** the listed trees, or exclude it by name in
+  the producer (`--exclude photos.state.json`) - otherwise its own size/mtime changes show up as
+  library changes. Other `importPaths` of a library get their own `--path` in the producer steps
+  (repeatable); the comparer compares every entry of the documents.
 
-### What is compared
-
-- Per file: **size and mtime in nanoseconds**. No file content is read, no hash is computed, so a
-  walk over a 100k-file library is just directory metadata.
-- Directories are tracked by name, which is what makes added and removed **empty** directories
-  visible. Renames count as `added` + `removed`.
-- `--list` names the reason per file: `(1 -> 4 bytes)` for a resized file, `(same size, newer mtime)`
-  for one that was rewritten in place. That second case is why the size alone is not enough, and why
-  a backup restored with old timestamps is still caught.
-- Symlinks are never followed - a link is a leaf, so retargeting it is a change while changes behind
-  it are invisible.
-- Ignored: the NAS and OS noise `@eaDir`, `.DS_Store`, `Thumbs.db`, `*.tmp` plus every `--exclude`
-  pattern (shell wildcards, matched against the path below the root and against the bare file name).
-  The state file itself is ignored, even if it lives inside a watched tree.
-- An unreadable *root* is a hard error (`1`) in both modes - an empty walk would otherwise look like
-  "everything was deleted". Unreadable subdirectories are reported and skipped.
-
-### Modes
-
-| Mode | Writes | Walks | Answer |
-| --- | --- | --- | --- |
-| `--check` (default) | never | yes | `changed=yes` / `changed=no` |
-| `--record` | only with `--apply` | yes | `WOULD RECORD ...` / `RECORDED ...` |
-| `--status` | no | no | what the state file holds (paths, timestamps, counts) |
-
-`--check` never writes, not even when the state file is missing, and a broken or foreign state file
-fails open: it logs a warning and reports `changed=yes` (reason `state-unreadable`), one scan too many
-beats a missed change. A state file recorded for other `--path` values reports `paths-changed`.
+A state that cannot be used fails open: a missing baseline reports `changed=yes` (reason `no-state`),
+and a broken or foreign one warns and also reports `changed=yes` (`baseline-unreadable`,
+`baseline-malformed`) - one scan too many beats a missed change. A baseline with a different set of
+paths reports `paths-changed`.
 
 ### Usage
 
 ```bash
-# detect (read-only), then record the new baseline after a successful scan
-uv run external_library_changes.py --path /srv/photos --state photos.state.json --check
-uv run external_library_changes.py --path /srv/photos --state photos.state.json --record --apply
+# produce, compare, act, then let the producer write the baseline
+uv run external_library_snapshot.py --path /srv/photos --out photos.now.json
+uv run external_library_snapshot_compare.py --state photos.state.json --current photos.now.json --list
+uv run external_library_snapshot.py --path /srv/photos --out photos.state.json   # after the action
 
 # shell gate instead of a dagu precondition
-uv run external_library_changes.py --path /srv/photos --state photos.state.json --check -q | grep -q '^changed=yes'
-
-# what changed, and when was the last record?
-uv run external_library_changes.py --path /srv/photos --state photos.state.json --check --list
-uv run external_library_changes.py --state photos.state.json --status
-
-# two import paths, machine-readable report
-uv run external_library_changes.py --path /srv/photos --path /srv/videos --state both.state.json --check --list --json
+uv run external_library_snapshot.py --path /srv/photos -q | \
+    uv run external_library_snapshot_compare.py --state photos.state.json --current - -q
 ```
 
 ```console
-$ uv run external_library_changes.py --path /srv/photos --state photos.state.json --check --list
-state: photos.state.json (record 7, updated 2026-09-28 19:31:02+0200)
-watching: /srv/photos (54027 files, 3812 dirs)
+$ uv run external_library_snapshot_compare.py --state photos.state.json --current photos.now.json --list
+baseline: photos.state.json (external_library_snapshot, 2026-09-28T19:31:02+0200, 1 path)
+current: /srv/photos (54027 files, 3812 dirs)
 changes: added=1 removed=1 modified=1 dirs_added=1 dirs_removed=0
   ~ /srv/photos/2026/urlaub/img_0001.jpg (4821337 -> 4820999 bytes)
   + /srv/photos/2026/urlaub/img_0002.jpg
   - /srv/photos/2026/alt/scan_01.tif
   + dir /srv/photos/2026/neu
 changed=yes
-
-$ uv run external_library_changes.py --state photos.state.json --status
-state: photos.state.json
-tool: external_library_changes (version 1)
-created: 2026-09-14 08:00:00+0200
-updated: 2026-09-28 19:31:02+0200 (age 1.2h)
-records: 7
-paths: 1
-  /srv/photos - 54027 files, 3812 dirs
 ```
+
+### What is compared
+
+- Per file: **size and mtime in nanoseconds**. No file content is read, no hash is computed, so a
+  state over a 100k-file library is just directory metadata.
+- Directories are tracked by name, which is what makes added and removed **empty** directories
+  visible. Renames count as `added` + `removed`.
+- `--list` names the reason per file: `(1 -> 4 bytes)` for a resized file, `(same size, newer mtime)`
+  for one that was rewritten in place. That second case is why the size alone is not enough, and why
+  a backup restored with old timestamps is still caught.
 
 ### Options
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--path DIR` | - | directory to watch, repeatable; required unless `--status` |
-| `--state FILE` | - | snapshot to compare against / write, **required** |
-| `--check` / `--record` / `--status` | `--check` | what the run does (see the table above) |
-| `--apply` | off | let `--record` actually write; `--apply` without `--record` is an error |
-| `--exclude PATTERN` | - | extra ignore pattern, repeatable (defaults always apply) |
+| `--state FILE` | - | the baseline, i.e. the state of the last successful run; **required** |
+| `--current FILE` | - | the state produced for this run; `-` reads stdin; **required** |
 | `--list` | off | list the changed paths, at most 20 per kind (also in the JSON `details`) |
 | `--json` | off | one JSON report on stdout, human lines move to stderr |
-| `-q`, `-v` | - | only the verdict / log every walked directory |
+| `-q`, `-v` | - | only the verdict / log what is compared |
 
-Exit codes: `0` the verdict was determined (changed or not) or the record was written,
-`1` the run failed (a root could not be read, the state file could not be written), `2`
-configuration error (missing or unusable arguments, a `--path` that is not a directory).
+Exit codes: `0` the verdict was determined (changed or not), `2` configuration error (missing
+arguments, an unusable `--current`). A baseline that is missing or unusable is **not** an error: the
+comparer reports `changed=yes` and says why - one scan too many beats a missed change.
 
-The JSON report of `--check` carries `changed`, `reason` (`changed`, `unchanged`, `no-state`,
-`state-unreadable`, `paths-changed`), `previous` (the state's timestamps and `records` counter),
-`paths` (per path: file/dir counts and its own `changes`) and `changes` (the summed
+The JSON report carries `state`, `current`, `producer` (the metadata of the state that was compared),
+`changed`, `reason` (`changed`, `unchanged`, `no-state`, `baseline-unreadable`, `baseline-malformed`,
+`paths-changed`), `paths` (per path: file/dir counts and its own `changes`) and `changes` (the summed
 `added`/`removed`/`modified`/`dirs_added`/`dirs_removed`/`total`); with `--list` it also carries
-`details` with the capped path lists plus an `omitted` counter. The state file itself is JSON:
-`{"tool", "version", "created_at", "updated_at", "records", "paths": [{"path", "files", "dirs"}]}`
-with `files` mapping each relative path to `[size, mtime_ns]`. It is written atomically (temp file
-plus `os.replace`), and `--status` never touches it.
+`details` with the capped path lists plus an `omitted` counter.
 
+## `external_library_snapshot.py`
+
+Lists local directory trees into a state document - the local counterpart of
+`external_library_smb_snapshot.py`. `--path` is repeatable and is also the key the comparer stores, so
+it has to stay stable between runs.
+
+```bash
+# one tree to a file, two trees into the comparer
+uv run external_library_snapshot.py --path /srv/photos --out photos.now.json
+uv run external_library_snapshot.py --path /srv/photos --path /srv/videos -q | \
+    uv run external_library_snapshot_compare.py --state both.state.json --current - -q
+```
+
+- `os.scandir`/`DirEntry.stat` only: no file is opened, no content read, no hash computed.
+- Symlinks are leaves (never followed), directories are tracked by name (empty ones stay visible),
+  `--exclude` matches the path below the root and the bare name (repeatable, or several patterns
+  separated by commas), and the noise list (`@eaDir`, `.DS_Store`, `Thumbs.db`, `*.tmp`) is the same
+  as the SMB producer's.
+- The snapshot goes to stdout, progress to stderr (`-q` silences it), `--list` previews the first
+  entries. The file this run writes is never part of its own snapshot.
+- Exit codes: `0` snapshot written, `1` a tree could not be read (nothing is written, so a half empty
+  tree can never be compared), `2` configuration error.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--path DIR` | - | directory to list, repeatable, **required**; the value is the key in the state |
+| `--exclude PATTERN` | - | extra ignore pattern; repeatable, and one flag may carry several separated by commas (defaults always apply) |
+| `--out FILE` | `-` | write the snapshot here; `-` is stdout |
+| `--list` | off | preview the first entries on stderr |
+| `-q`, `-v` | - | quiet progress / log every listed directory |
+
+
+## `external_library_smb_snapshot.py`
+
+Walks an SMB share **over SMB2/3 without a mount** - no cifs, no FUSE/rclone, no root - and writes the
+same state document `external_library_snapshot_compare.py` compares, just from the share instead of a
+local path. It exists because a mount turns every `stat` into its own round trip: on a slow share that
+costs about a millisecond per *file*. An SMB directory listing already carries size and mtime, so the
+same walk needs **one request per directory** plus the listing payload.
+
+The walk is `QUERY_DIRECTORY`/`FileDirectoryInformation` per directory - name, size, mtime and the
+directory flag, which is all the comparison needs - exactly the metadata a mount-using client gets,
+just through the cheap client path:
+
+```
+CONNECT/DELETE-free: 1 x CREATE + 1..n x QUERY_DIRECTORY + 1 x CLOSE  per directory
+payload:            ~110 bytes per entry (name, size, FILETIME)
+```
+
+- Needs `smbprotocol` (in the PEP 723 header, so `uv run` fetches it), Python 3.10+ and an **SMB2 or
+  newer** server (SMB1 cannot be reached). Credentials: NTLM by default, Kerberos with
+  `smbprotocol[kerberos]` plus a ticket. The share user only needs read access.
+- `--connections N` opens N sessions (N TCP connections, one worker each) and shards the walk over
+  them. That is the lever when a single session is capped by the server, which is the normal case.
+  Measured on a NAS, walking 1 038 directories with 54 336 files:
+
+  | Sessions | Wall time | Entries/s |
+  | --- | --- | --- |
+  | 1 | 79,5 s | 700 |
+  | 2 | 29,3 s | 1 890 |
+  | 4 | 22,9 s | 2 420 |
+  | 8 | 22,1 s | 2 500 |
+  | 16 | 23,1 s | 2 400 |
+  | 32 | 26,6 s | 2 080 |
+  | 16 threads on 1 session | 39,0 s | 1 420 |
+
+  The knee is at 4 to 8 sessions - **8 is the value to use**; a difference between 8 and 16 is noise,
+  and 32 was slower (26,6 s). The same tree measured 23-35 s across runs, so the NAS's own load shows
+  up as much as any setting. A refused session is a warning and only "no session at all" is fatal.
+- Same filtering rules as the local producer: `--exclude` applies to files and directories (an
+  excluded directory is not descended into, which is the only way to save real work; repeatable, or
+  several patterns separated by commas), the usual NAS noise (`@eaDir`, `.DS_Store`, `Thumbs.db`,
+  `*.tmp`) is always ignored, symlinks/reparse points stay leaves, and directories are tracked by name
+  so empty ones remain visible.
+- Output: `{"tool", "version", "generated_at", "source", "paths": [{"path", "files", "dirs"}],
+  "unreadable", "elapsed_seconds"}`, with `files` mapping a path relative to the start to
+  `[size, mtime_ns]`.
+- The snapshot goes to **stdout**, progress and warnings to **stderr** (`-q` silences the progress), so
+  producer and comparer compose in one pipeline.
+- Exit codes: `0` snapshot written, `1` the share or the start directory could not be read (nothing is
+  written, so a half empty tree can never be compared), `2` configuration error (missing credentials,
+  unwritable `--out`).
+
+### Usage
+
+```bash
+# write a state next to the baseline
+SMB_USER=immich SMB_PASSWORD=... uv run external_library_smb_snapshot.py \
+    --host nas --share photos --key /srv/photos --out /var/lib/dagu/photos.now.json
+
+# or straight into the comparer, without a file in between
+SMB_USER=immich SMB_PASSWORD=... uv run external_library_smb_snapshot.py \
+    --host nas --share photos --key /srv/photos -q \
+    | uv run external_library_snapshot_compare.py --state /var/lib/dagu/photos.state.json --current - -q
+
+# a subtree of a share, walking with 8 sessions, password from a 600 file
+SMB_USER=immich uv run external_library_smb_snapshot.py --host nas --share photos --subdir 2026 \
+    --key /srv/photos --password-file /etc/immich-smb.cred --connections 8 --out photos.now.json
+```
+
+### In a DAG
+
+The SMB producer replaces the local one; everything else is the same DAG:
+
+```yaml
+steps:
+  - id: snapshot
+    run: >-
+      uv run external_library_smb_snapshot.py --host nas --share photos --key /srv/photos
+      --password-file /etc/immich-smb.cred --connections 8 --out /var/lib/dagu/photos.now.json
+  - id: detect
+    depends: snapshot
+    run: >-
+      uv run external_library_snapshot_compare.py --state /var/lib/dagu/photos.state.json
+      --current /var/lib/dagu/photos.now.json
+    output: CHANGED
+  - id: scan
+    depends: detect
+    preconditions:
+      - condition: ${CHANGED}
+        expected: changed=yes
+    run: uv run external_library_scan.py --apply --wait
+  - id: record
+    depends: scan
+    run: >-
+      uv run external_library_smb_snapshot.py --host nas --share photos --key /srv/photos
+      --password-file /etc/immich-smb.cred --connections 8 --out /var/lib/dagu/photos.state.json
+```
+
+`--key` is the name this tree is remembered under - the `path` in the state. Leave it out while the SMB
+producer is the library's only source; pass the path a mount-based producer would use
+(`--key /srv/photos`) when such a state already exists, so the switch costs one `changed=yes`
+(`paths-changed`) and both producers can share one state. The record step walks the share a second
+time (~20 s on the example NAS) - it only runs when something really changed.
+
+### Limits worth knowing
+
+- A single session is capped by the server, not by the client: SMB2 allows only as many requests in
+  flight as the server granted credits for, and servers also cap their own request handling. Each
+  session asks for the same fixed window (`SESSION_CREDITS`, independent of `--connections`, because
+  one session now feeds one worker) and `-v` prints the answer (`credits: 16 (requested 16)`); the
+  same share ran 2x faster with 16 threads on one session and 3.4x faster with 16 sessions.
+- What remains is the server's cost per directory **entry**: on that share a listing of 1 143 files
+  took 0,79 s with size+mtime and 0,67 s with names only, so ~0,6 ms are charged per entry no matter
+  what is asked for - 55 374 entries therefore cost ~24 s whatever the client does. Asking for
+  `FileIdBothDirectoryInformation` instead of `FileDirectoryInformation`, or for names only, does not
+  change it. Only asking for fewer entries helps - which costs resolution.
+- It is the same server: if the **server** is slow per entry (a NAS filling attributes for every
+  entry of the listing) or the link is saturated, this walk is slow too. Only a client that avoids the
+  enumeration can help there, not a faster client.
+- Changing the source of an existing library (mount walk <-> SMB snapshot) reports every file as
+  `modified` once and is quiet afterwards: both describe the same server timestamp, but the SMB path
+  rounds to microseconds.
+- It is a one-shot snapshot, not a watcher: it cannot tell you "something happened 30 seconds ago".
+- Two SMB clients on one host (rclone mount + this walk) are fine; they are separate sessions.
 ## Tests
 
 ```bash
 uv run tests/test_favorite_rated.py
 uv run tests/test_conditional_albums.py
 uv run tests/test_external_library_scan.py
-uv run tests/test_external_library_changes.py
+uv run tests/test_external_library_snapshot.py
+uv run tests/test_external_library_snapshot_compare.py
+uv run tests/test_external_library_smb_snapshot.py
 ```
 
 All suites fake the HTTP layer, so they never touch a real server. The failure paths above are
@@ -540,15 +700,31 @@ reproducible. On the reporting side it covers the statistics degradation
 (`test_a_failing_statistics_call_degrades_to_unknown_counts`), the `refreshed=never` case and
 `test_statistics_are_read_before_the_scans_start`.
 
-The `external_library_changes` suite works on temp directories instead of a fake server, because the
-script has no HTTP layer at all. It pins the compare logic, e.g. `test_deeply_nested_change_is_found`
-(a file five levels down), `test_same_size_with_a_newer_mtime_is_a_change`,
-`test_resized_file_is_a_change_even_with_a_restored_mtime` and `test_empty_directories_are_tracked`,
-plus the safety properties: `test_check_never_rewrites_the_state_file`,
-`test_state_file_inside_the_watched_tree_is_ignored`, `test_unusable_state_fails_open_with_a_warning`,
-`test_unreadable_root_fails_instead_of_recording_an_empty_tree` (skipped on Windows, where `chmod`
-does not make a directory unreadable) and `test_the_whole_dag_cycle_works` (check -> record -> check
--> change -> record -> check).
+The `external_library_snapshot` suite runs the local producer against temp directories: deep nesting,
+empty directories, symlinks as leaves, the exclude rules, an unreadable subdirectory (counted, not
+fatal) and an unreadable root (`test_an_unreadable_root_fails_without_writing_a_snapshot`, skipped on
+Windows where `chmod` does not make a directory unreadable). Its last test feeds a produced document
+through the comparer and checks that not a single entry changes on the way.
+
+The `external_library_snapshot_compare` suite works on synthetic states, because the comparer never
+touches the filesystem: the diff itself (added/removed/modified, plus `(1 -> 4 bytes)` and
+`(same size, newer mtime)` in `--list`), the fail-open cases (a missing, broken or foreign baseline
+reports `changed=yes`), `paths-changed`, the stdin variant, `--json` and every configuration error (an
+unusable `--current` is exit `2`). `test_nothing_is_written_anywhere` pins that the comparer leaves both
+documents alone, and two tests drive the real producer through it (`produce -> compare -> produce ->
+compare`, plus the pipeline form).
+
+The `external_library_smb_snapshot` suite needs neither a server nor the `smbprotocol` package: the
+walk takes an injected directory lister, so the SMB specifics are the only untested part. It pins the
+walk itself (`test_parallel_connections_produce_the_same_result`,
+`test_unreadable_subdirectory_is_counted_but_not_fatal`, an excluded directory that must never be
+listed), the FILETIME conversion, the reparse-point handling, the version-tolerant session arguments
+(`test_session_credentials_fit_the_installed_smbprotocol_version`), the credit window (the session id
+is used, a refused credit request stays non-fatal) and the sessions (one per connection, all closed
+again, a refused session degrades to a warning, no session at all is exit `1`, and a session is never
+handed to two listings at once). `test_the_produced_document_becomes_the_baseline` runs the produced
+document through the comparer for real. `tests/test_external_library_snapshot.py` keeps both noise
+lists identical.
 
 ## License
 
