@@ -21,14 +21,14 @@ writes anything - it stays a pure function of its two inputs.
 
 Usage:
     # the DAG: produce, compare, act, then produce into the state file again
-    uv run external_library_snapshot.py --path /srv/photos --out photos.state.json
-    uv run external_library_snapshot.py --path /srv/photos --out photos.now.json
-    uv run external_library_snapshot_compare.py --state photos.state.json --current photos.now.json
-    # ... run the action, then let the producer overwrite the baseline
-
-    # or straight through a pipeline
-    uv run external_library_snapshot.py --path /srv/photos -q | \\
+    uv run external_library_snapshot.py --path /srv/photos -q | \
         uv run external_library_snapshot_compare.py --state photos.state.json --current - -q
+    # ... run the action, then let the producer overwrite the baseline
+    uv run external_library_snapshot.py --path /srv/photos --out photos.state.json
+
+    # keep the walk on disk when a human wants the details afterwards
+    uv run external_library_snapshot.py --path /srv/photos --out photos.now.json
+    uv run external_library_snapshot_compare.py --state photos.state.json --current photos.now.json --list
 
 The verdict is the trailing `changed=yes|no` line (`changed` in the --json report), not the exit code:
 a step that exits non-zero counts as failed in most schedulers, so a DAG gates on the line

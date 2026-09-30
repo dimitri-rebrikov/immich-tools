@@ -409,15 +409,11 @@ env:
   - IMMICH_URL: https://immich.example.com
   - IMMICH_API_KEY: ${IMMICH_API_KEY}
 steps:
-  - id: snapshot
-    run: >-
-      uv run external_library_snapshot.py --path /srv/photos
-      --out /var/lib/dagu/photos.now.json
   - id: detect
-    depends: snapshot
-    run: >-
-      uv run external_library_snapshot_compare.py --state /var/lib/dagu/photos.state.json
-      --current /var/lib/dagu/photos.now.json
+    run: |
+      uv run external_library_snapshot.py --path /srv/photos -q | \
+        uv run external_library_snapshot_compare.py --state /var/lib/dagu/photos.state.json \
+          --current - -q
     output: CHANGED
   - id: scan
     depends: detect
@@ -620,15 +616,12 @@ The SMB producer replaces the local one; everything else is the same DAG:
 
 ```yaml
 steps:
-  - id: snapshot
-    run: >-
-      uv run external_library_smb_snapshot.py --host nas --share photos --key /srv/photos
-      --password-file /etc/immich-smb.cred --connections 8 --out /var/lib/dagu/photos.now.json
   - id: detect
-    depends: snapshot
-    run: >-
-      uv run external_library_snapshot_compare.py --state /var/lib/dagu/photos.state.json
-      --current /var/lib/dagu/photos.now.json
+    run: |
+      uv run external_library_smb_snapshot.py --host nas --share photos --key /srv/photos \
+        --password-file /etc/immich-smb.cred --connections 8 -q | \
+        uv run external_library_snapshot_compare.py --state /var/lib/dagu/photos.state.json \
+          --current - -q
     output: CHANGED
   - id: scan
     depends: detect
